@@ -8,7 +8,7 @@ type class_label = int
 type sample = features (* X *) *
               class_label (* y *)
 
-type metric = Gini (* default *)
+type metric = Gini(* default *)
             | Shannon (* TODO *)
             | MCC (* TODO *)
 

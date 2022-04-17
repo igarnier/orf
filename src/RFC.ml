@@ -6,7 +6,7 @@
 (* Random Forets Classifier *)
 
 module A = BatArray
-module Ht = BatHashtbl
+module Ht = Hashtbl
 module IntMap = BatMap.Int
 module IntSet = BatSet.Int
 module L = BatList
@@ -16,9 +16,13 @@ module RNG = BatRandom.State
 open Printf
 
 type features = int IntMap.t
+type internal_features = (int, int) Ht.t
 type class_label = int
 
 type sample = features (* X *) *
+              class_label (* y *)
+
+type internal_sample = internal_features (* X *) *
               class_label (* y *)
 
 type tree = Leaf of class_label
@@ -30,11 +34,23 @@ type metric = Gini (* default *)
             | Shannon (* TODO; WARN: check min value is still 0.0 *)
             | MCC (* TODO; WARN: check min value is still 0.0 *)
 
+let to_internal_features feat =
+  Ht.of_seq (IntMap.to_seq feat)
+
+let to_features feat =
+  IntMap.of_seq (Ht.to_seq feat)
+
+let to_internal_sample (feat, class_label) =
+  (to_internal_features feat, class_label)
+
+let to_sample (internal_feat, class_label) =
+  (to_features internal_feat, class_label)
+
 (* a feature with non constant value allows to discriminate samples *)
-let collect_non_constant_features samples =
+let collect_non_constant_features_internal (samples : (internal_features * 'a) array) =
   let feat_vals = Ht.create 11 in
   A.iter (fun (features, _class_label) ->
-      IntMap.iter (fun feature value ->
+      Ht.iter (fun feature value ->
           try
             let prev_values = Ht.find feat_vals feature in
             Ht.replace feat_vals feature (IntSet.add value prev_values)
@@ -50,19 +66,29 @@ let collect_non_constant_features samples =
       else (feat, vals) :: acc
     ) feat_vals []
 
+let collect_non_constant_features (samples : (features * 'a) array) =
+  collect_non_constant_features_internal (Array.map to_internal_sample samples)
+
 let feat_get feat features =
-  IntMap.find_default 0 feat features
+  try Ht.find features feat with
+  | Not_found -> 0
 
 (* split a node *)
 (* FBR: maybe this can be accelerated:
  *   we need all samples sorted per feature;
  *   we need a list of the index of remaining samples *)
-let partition_samples feature threshold samples =
+let partition_samples_internal feature threshold (samples : (internal_features * 'a) array) =
   A.partition (fun (features, _class_label) ->
       (* sparse representation --> 0s almost everywhere *)
       let value = feat_get feature features in
       value <= threshold
     ) samples
+
+let partition_samples feature threshold (samples : (features * 'a) array) =
+  let left, right =
+    partition_samples_internal feature threshold (Array.map to_internal_sample samples)
+  in
+  (Array.map to_sample left, Array.map to_sample right)
 
 let _partition_samples_index index feature threshold sample_indexes =
   (* sample indexes with feat's val <= threshold *)
@@ -77,7 +103,7 @@ let _index_samples samples =
   let all_sample_indexes = (* [0..n-1] *)
     let n = A.length samples in
     IntSet.of_array (A.init n (fun i -> i)) in
-  let feat_vals = collect_non_constant_features samples in
+  let feat_vals = collect_non_constant_features_internal samples in
   L.fold_left (fun acc1 (feature, values) ->
       IntMap.add feature
         (fst
@@ -98,18 +124,20 @@ let _index_samples samples =
     ) IntMap.empty feat_vals
 
 (* how many times we see each class label *)
-let class_count_samples samples =
-  let ht = Ht.create 11 in
+let class_count_samples (samples : internal_sample array) =
+  let counts = A.create 2 0 in
   A.iter (fun (_features, class_label) ->
-      let prev_count = Ht.find_default ht class_label 0 in
-      Ht.replace ht class_label (prev_count + 1)
+      counts.(class_label) <- counts.(class_label) + 1 ;
     ) samples;
-  ht
+  counts
 
 let class_count_labels labels =
   let ht = Ht.create 11 in
   A.iter (fun class_label ->
-      let prev_count = Ht.find_default ht class_label 0 in
+      let prev_count =
+        try Ht.find ht class_label with
+        | Not_found -> 0
+      in
       Ht.replace ht class_label (prev_count + 1)
     ) labels;
   ht
@@ -117,14 +145,14 @@ let class_count_labels labels =
 (* Formula comes from the book:
    "Hands-on machine learning with sklearn ...", A. Geron.
    Same formula in wikipedia. *)
-let gini_impurity samples =
+let gini_impurity (samples : internal_sample array) =
   let n = float (A.length samples) in
   let counts = class_count_samples samples in
   let sum_pi_squares =
-    Ht.fold (fun _class_label count acc ->
+    A.fold (fun acc count ->
         let p_i = (float count) /. n in
         (p_i *. p_i) +. acc
-      ) counts 0.0 in
+      ) 0.0 counts in
   1.0 -. sum_pi_squares
 
 let metric_of = function
@@ -149,7 +177,7 @@ let cost_function metric left right =
     ((w_left  *. (metric left)) +.
      (w_right *. (metric right)))
 
-let majority_class rng samples =
+let majority_class rng (samples : internal_sample array) =
   if A.length samples = 0 then
     assert(false)
   else if A.length samples = 1 then
@@ -157,16 +185,12 @@ let majority_class rng samples =
   else
     let ht = class_count_samples samples in
     (* find max count *)
-    let max_count =
-      Ht.fold (fun _class_label count acc ->
-          max count acc
-        ) ht 0 in
+    let max_count = A.fold Int.max 0 ht in
     (* randomly draw from all those with max_count *)
-    let majority_classes =
-      Ht.fold (fun class_label count acc ->
+    let majority_classes = A.fold_lefti (fun acc class_label count ->
           if count = max_count then class_label :: acc
           else acc
-        ) ht [] in
+        ) [] ht in
     (* let chosen = Utls.array_rand_elt rng majority_classes in
      * Log.info "majority: %d" chosen;
      * chosen *)
@@ -188,18 +212,91 @@ let choose_min_cost rng = function
         ) [] cost_splits in
     Utls.list_rand_elt rng candidates
 
+(* [dichotomic_search elts pred] assumes that [pred] is
+   a monotonic predicate wrt [elts]: if [pred elts.(i)]
+   is verified then [pred elts.(j)] must hold for all [0 <= j <= i].
+
+   This function returns [All_above] if no element
+   satisfies [pred]. Otherwise, it returns [Below_index k] with
+   [k] the greatest index such that no element [elts.(i)] with
+   [i > k] verifies [pred].
+
+   Example:
+
+   val array : int array = [|10; 20; 20; 30|]
+
+   # dichotomic_search array (fun elt -> elt <= 9) ;;
+   - : result = All_above
+
+   # dichotomic_search array (fun elt -> elt <= 10) ;;
+   - : result = Below_index 0
+
+   # dichotomic_search array (fun elt -> elt <= 19) ;;
+   - : result = Below_index 0
+
+   # dichotomic_search array (fun elt -> elt <= 20) ;;
+   - : result = Below_index 2
+
+   # dichotomic_search array (fun elt -> elt <= 29) ;;
+   - : result = Below_index 2
+
+   # dichotomic_search array (fun elt -> elt <= 30) ;;
+   - : result = Below_index 3
+
+   # dichotomic_search array (fun elt -> elt <= 31) ;;
+   - : result = Below_index 3
+ *)
+(* let dichotomic_search (elts : 'a array) pred =
+ *   let rec loop low hi =
+ *     if low = hi then
+ *       let x = elts.(low) in
+ *       if pred x then
+ *         Below_index low
+ *       else
+ *         Below_index (low - 1)
+ *     else
+ *       (let mid = low + (hi - low) / 2 in
+ *        let x = elts.(mid) in
+ *        if pred x then
+ *          loop (mid + 1) hi
+ *        else
+ *          loop low mid)
+ *    in
+ *    let last = Array.length elts - 1 in
+ *    if pred elts.(0) then
+ *      loop 0 last
+ *    else
+ *      All_above *)
+
+let fold_partitions f list acc =
+  let rec loop f list prefix acc =
+    match list with
+    | [] -> assert false
+    | [x, bucket] ->
+      let suffix = bucket in
+      let acc = f x prefix suffix acc in
+      acc, suffix
+    | (x, bucket) :: tl ->
+      let acc, suffix = loop f tl (List.rev_append bucket prefix) acc in
+      let suffix = List.rev_append bucket suffix in
+      let acc = f x prefix suffix acc in
+      acc, suffix
+  in
+  let acc, _ =
+    loop f list [] acc in acc
+
 (* maybe this is called the "Classification And Regression Tree" (CART)
    algorithm in the litterature *)
 let tree_grow (rng: Random.State.t) (* seeded RNG *)
-    (metric: sample array -> float) (* hyper params *)
+    (metric: internal_sample array -> float) (* hyper params *)
     (max_features: int)
     (max_samples: int)
     (min_node_size: int)
-    (training_set: sample array) (* dataset *) : tree * int array =
+    (training_set: internal_sample array) (* dataset *) : tree * int array =
   let bootstrap, oob =
     (* First randomization introduced by random forests: bootstrap sampling *)
     Utls.array_bootstrap_sample_OOB rng max_samples training_set in
-  let rec loop samples =
+  let rec loop (samples : internal_sample array) =
     (* min_node_size is a regularization parameter; it also allows to
      * abort tree building (might be interesting for very large datasets) *)
     if A.length samples <= min_node_size then
@@ -207,7 +304,7 @@ let tree_grow (rng: Random.State.t) (* seeded RNG *)
     else
       (* collect all non constant features *)
       let split_candidates =
-        let all_candidates = collect_non_constant_features samples in
+        let all_candidates = collect_non_constant_features_internal samples in
         (* randomly keep only N of them:
            Second randomization introduced by random forests
            (random feature sampling). *)
@@ -217,18 +314,27 @@ let tree_grow (rng: Random.State.t) (* seeded RNG *)
         Leaf (majority_class rng samples)
       | _ ->
         (* select the (feature, threshold) pair minimizing cost *)
-        let candidate_splits =
-          L.fold (fun acc1 (feature, values) ->
-              IntSet.fold (fun value acc2 ->
-                  (feature, value, partition_samples feature value samples)
-                  :: acc2
-                ) values acc1
-            ) [] split_candidates in
+        let table = Hashtbl.create 11 in
         let split_costs =
-          L.rev_map (fun (feature, value, (left, right)) ->
-              let cost = cost_function metric left right in
-              (cost, feature, value, (left, right))
-            ) candidate_splits in
+          L.fold (fun acc (feature, values) ->
+              Hashtbl.clear table ;
+              A.iter (fun ((f, _cl) as sample) ->
+                  Hashtbl.add table (feat_get feature f) sample
+                ) samples ;
+              let buckets : (int * internal_sample list) list =
+                IntSet.to_seq values
+                |> Seq.map (fun value ->
+                    let samples = Hashtbl.find_all table value in
+                    (value, samples))
+                |> List.of_seq
+              in
+              fold_partitions (fun value left right acc ->
+                let left = Array.of_list left in
+                let right = Array.of_list right in
+                let cost = cost_function metric left right in
+                (cost, feature, value, (left, right)) :: acc
+              ) buckets acc
+          ) [] split_candidates in
         (* choose one split minimizing cost *)
         let cost, feature, threshold, (left, right) =
           choose_min_cost rng split_costs in
@@ -270,6 +376,7 @@ let array_parmap ncores f a init =
     ~mux:(fun (i, y) -> A.unsafe_set res i y);
   res
 
+
 let forest_grow
     ncores rng metric ntrees max_features max_samples min_node_size train =
   (* treat the RNG as a seed stream, for reproducibility
@@ -278,7 +385,11 @@ let forest_grow
   array_parmap ncores
     (fun seed ->
        let rng' = RNG.make [|seed|] in
-       tree_grow rng' metric max_features max_samples min_node_size train
+       let now = Unix.gettimeofday () in
+       let res = tree_grow rng' metric max_features max_samples min_node_size train in
+       let later = Unix.gettimeofday () in
+       Format.printf "processing time: %f@." (later -. now) ;
+       res
     )
     seeds (Leaf 0, [||])
 
@@ -321,6 +432,7 @@ let train (ncores: int)
       Utls.enforce (1 <= min_node_size && min_node_size < n)
         "RFC.train: min_node_size not in [1,n[" in
     min_node_size in
+  let train = Array.map to_internal_sample train in
   forest_grow
     ncores rng metric_f ntrees max_feats max_samps min_node train
 
@@ -338,6 +450,7 @@ let tree_predict tree (features, _label) =
 
 (* label to predicted probability hash table *)
 let predict_one_proba ncores forest x =
+  let x = to_internal_sample x in
   let pred_labels =
     array_parmap ncores
       (fun (tree, _oob) -> tree_predict tree x) forest 0 in
@@ -383,7 +496,7 @@ let predict_OOB rng forest train =
   let n = A.length train in
   let oob_idx2preds = Ht.create n in
   A.iter (fun (tree, oob) ->
-      let train_OOB = extract oob train in
+      let train_OOB = Array.map to_internal_sample @@ extract oob train in
       let truths = A.map snd train_OOB in
       let preds = A.map (tree_predict tree) train_OOB in
       Utls.array_iter3 oob truths preds (fun oob_idx truth pred ->
@@ -400,6 +513,7 @@ let predict_OOB rng forest train =
       let preds =
         let pred_labels = A.of_list preds' in
         A.map (fun label -> (IntMap.empty, label)) pred_labels in
+      let preds = Array.map to_internal_sample preds in
       A.unsafe_set truth_preds i (truth, majority_class rng preds)
     ) oob_idx2preds;
   truth_preds
